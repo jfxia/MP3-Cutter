@@ -13,7 +13,7 @@
 • One-click export to MP3 with original bitrate or 192 kbps fallback.  
 
 
-## Installation
+## Prerequesties
 
    ```bash
    pip install PyQt5 matplotlib pydub numpy math
