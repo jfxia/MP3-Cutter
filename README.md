@@ -23,19 +23,19 @@
 
 1. Run the program  
    ```bash
-   python mp3cutter.py
+   python .\mp3cutter.py
    ```
 
 2. **Open audio file**  
    • Drag & drop onto the window, or  
-   • Click “Select MP3 File…”
+   • Click “Load MP3 File…”
 
 3. **Set clip range**  
    • Drag ▼  (start) and ▲ (end) arrows on the waveform, or  
    • Edit the “Start / End” time boxes.
 
 4. **Preview**  
-   Click ▶ Play to hear only the selected region.
+   Click ▶ Play to hear only the selected audio range.
 
 5. **Export clip**  
    Click “Export Clip”, choose a destination, done!
