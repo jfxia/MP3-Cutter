@@ -10,6 +10,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
+from matplotlib.lines import Line2D
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QPushButton, QLabel, QFileDialog,
                             QSlider, QTimeEdit, QMessageBox, QProgressBar,
@@ -112,6 +113,7 @@ class WaveformCanvas(FigureCanvas):
         self.is_loaded = False
         self.dragging = None
         self.xlim, self.ylim = None, None
+        self.playhead_line = None
         self.mpl_connect('button_press_event', self.on_click)
         self.mpl_connect('motion_notify_event', self.on_motion)
         self.mpl_connect('button_release_event', self.on_release)
@@ -144,6 +146,12 @@ class WaveformCanvas(FigureCanvas):
         self.duration, self.start_mark, self.end_mark = 0, 0, 0
         self.is_loaded, self.dragging = False, None
         self.xlim, self.ylim = None, None
+        if self.playhead_line:
+            try:
+                self.playhead_line.remove()
+            except Exception:
+                pass
+            self.playhead_line = None
         self.draw()
 
     def plot_waveform(self, samples, times, duration, sample_rate):
@@ -163,7 +171,19 @@ class WaveformCanvas(FigureCanvas):
         self._draw_highlight()
         self._draw_markers()
         self.fig.tight_layout()
+        self.playhead_line = Line2D([0, 0],
+                                    [self.ylim[0], self.ylim[1]],
+                                    color='red', linewidth=1, zorder=15)
+        self.axes.add_line(self.playhead_line)
+        self.playhead_line.set_visible(False)
         self.draw()
+
+    def set_playhead_position(self, seconds):
+        if self.playhead_line is None or not self.is_loaded:
+            return
+        self.playhead_line.set_xdata([seconds, seconds])
+        self.playhead_line.set_visible(True)
+        self.draw_idle()
 
     def _draw_highlight(self):
         if self.highlight_area:
@@ -213,8 +233,8 @@ class WaveformCanvas(FigureCanvas):
             self.end_marker = None
         self.ylim = self.axes.get_ylim()
         if self.is_loaded:
-            self.start_marker = self._create_triangle_marker(self.start_mark, SUCCESS_COLOR, 'up')
-            self.end_marker = self._create_triangle_marker(self.end_mark, DANGER_COLOR, 'down')
+            self.start_marker = self._create_triangle_marker(self.start_mark, '#FFFF00', 'up')
+            self.end_marker = self._create_triangle_marker(self.end_mark, '#FF0000', 'down')
             if not hasattr(self, 'legend') or self.legend not in self.axes.get_legend_handles_labels()[1]:
                 self.legend = self.axes.legend([self.start_marker, self.end_marker], ['Start', 'End'],
                                                loc='upper right', frameon=True, labelcolor=TEXT_COLOR)
@@ -270,7 +290,6 @@ class WaveformCanvas(FigureCanvas):
             self.main_window.update_time_edits()
         self.dragging = None
 
-    ### FIX: 优化 on_motion，end_mark 向右拖动不再卡顿，避免带动 start_mark
     def on_motion(self, event):
         if not self.is_loaded or self.dragging is None or event.inaxes != self.axes or event.xdata is None:
             return
@@ -600,6 +619,7 @@ class MP3Cutter(QMainWindow):
         self.playback_end_time = int(end * 1000)
         self.player.setPosition(int(start * 1000))
         self.player.play()
+        self.wave_canvas.set_playhead_position(self.player.position() / 1000.0)  # 保证立即出现
 
     def pause_audio(self):
         self.player.pause()
@@ -607,6 +627,8 @@ class MP3Cutter(QMainWindow):
     def stop_audio(self):
         self.player.stop()
         self.playback_end_time = None
+        self.wave_canvas.playhead_line.set_visible(False)   # 停止后隐藏
+        self.wave_canvas.draw_idle()
 
     def update_position(self, position):
         if self.playback_end_time is not None and position >= self.playback_end_time:
@@ -614,6 +636,8 @@ class MP3Cutter(QMainWindow):
         else:
             if not self.position_slider.isSliderDown():
                 self.position_slider.setValue(position)
+            # 新增：把毫秒转成秒，同步到波形图
+            self.wave_canvas.set_playhead_position(position / 1000.0)
 
     def update_duration(self, duration):
         self.position_slider.setRange(0, duration)
