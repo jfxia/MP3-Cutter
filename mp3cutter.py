@@ -455,6 +455,10 @@ class MP3Cutter(QMainWindow):
         time_layout.addSpacing(20)
         time_layout.addWidget(QLabel("End:"), 0)
         time_layout.addWidget(self.end_time_edit, 1)
+        time_layout.addSpacing(20)
+        self.duration_label = QLabel("Duration: 0.000 s")
+        self.duration_label.setObjectName("DurationLabel")
+        time_layout.addWidget(self.duration_label, 0)
         time_layout.addStretch()
         play_layout = QHBoxLayout()
         play_layout.setSpacing(10)
@@ -579,6 +583,7 @@ class MP3Cutter(QMainWindow):
             pass
         self.start_time_edit.timeChanged.connect(self.on_start_time_changed)
         self.end_time_edit.timeChanged.connect(self.on_end_time_changed)
+        self.update_duration_label()
 
     def on_loading_error(self, error_msg):
         QMessageBox.critical(self, "Loading Error", error_msg)
@@ -593,6 +598,15 @@ class MP3Cutter(QMainWindow):
         start, end = self.wave_canvas.get_selected_range()
         self.start_time_edit.setTime(QTime(0, 0, 0).addMSecs(int(start * 1000)))
         self.end_time_edit.setTime(QTime(0, 0, 0).addMSecs(int(end * 1000)))
+        self.update_duration_label()
+
+    def update_duration_label(self):
+        if not self.wave_canvas.is_loaded:
+            self.duration_label.setText("0.000 s")
+            return
+        start, end = self.wave_canvas.get_selected_range()
+        span = end - start
+        self.duration_label.setText(f"Duration: {span:.3f} s")
 
     def on_start_time_changed(self, time: QTime):
         if self._updating_time_edit or not self.wave_canvas.is_loaded:
@@ -627,7 +641,7 @@ class MP3Cutter(QMainWindow):
     def stop_audio(self):
         self.player.stop()
         self.playback_end_time = None
-        self.wave_canvas.playhead_line.set_visible(False)   # 停止后隐藏
+        self.wave_canvas.playhead_line.set_visible(False)
         self.wave_canvas.draw_idle()
 
     def update_position(self, position):
@@ -636,7 +650,6 @@ class MP3Cutter(QMainWindow):
         else:
             if not self.position_slider.isSliderDown():
                 self.position_slider.setValue(position)
-            # 新增：把毫秒转成秒，同步到波形图
             self.wave_canvas.set_playhead_position(position / 1000.0)
 
     def update_duration(self, duration):
@@ -795,13 +808,17 @@ if __name__ == '__main__':
             border-radius: 5px;
             padding: 8px;
             font-size: 20px;
+			font-weight:bold;
             selection-background-color: {ACCENT_COLOR};
             min-width: 140px;
         }}
         QTimeEdit:focus {{
             border: 1px solid {ACCENT_COLOR};
         }}
-        QTimeEdit#TimeEdit {{
+        
+		QLabel#DurationLabel {{
+            color: #FFFF00;
+            min-width: 100px;
         }}
         QSlider#PositionSlider::groove:horizontal {{
             height: 8px;
@@ -874,6 +891,7 @@ if __name__ == '__main__':
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
             background: none;
         }}
+
     """
     app.setStyleSheet(STYLESHEET)
     window = MP3Cutter()
