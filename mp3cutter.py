@@ -1,8 +1,9 @@
-# mp3cutter-c.py
+# mp3cutter.py
 
 import sys
 import os
 import base64
+import uuid
 import numpy as np
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -11,13 +12,20 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
 from matplotlib.lines import Line2D
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                            QHBoxLayout, QPushButton, QLabel, QFileDialog,
-                            QSlider, QTimeEdit, QMessageBox, QProgressBar,
-                            QFrame, QInputDialog, QSizePolicy)
-from PyQt5.QtCore import Qt, QUrl, QTime, QThread, pyqtSignal
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon, QPixmap
+
+from PyQt5.QtCore import QTimer, Qt, QUrl, QTime, QThread, pyqtSignal
+
+from PyQt5.QtGui import QDoubleValidator, QFont, QDragEnterEvent, QDropEvent, QIcon, QPixmap
+
+from PyQt5.QtWidgets import (QTabWidget, QSpinBox, QListWidget, QListWidgetItem,
+                             QAbstractItemView, QSplitter, QGroupBox, QLineEdit,
+                             QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
+                             QFileDialog, QSlider, QMessageBox, QInputDialog,
+                             QFrame, QApplication, QMainWindow, QWidget,
+                             QTimeEdit, QProgressBar, QSizePolicy)
+
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
+
 plt.rcParams["font.family"] = ["Segoe UI", "Microsoft YaHei"]
 plt.rcParams["axes.unicode_minus"] = False
 from pydub import AudioSegment
@@ -391,7 +399,7 @@ class MP3Cutter(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle('MP3 Cutter')
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1400, 1200)
         self.setMinimumSize(1000, 650)
         self.setWindowIcon(get_icon_from_b64(ICON_PLAY))
         central_widget = QWidget()
@@ -704,6 +712,496 @@ class MP3Cutter(QMainWindow):
             self.processing_thread.stop()
         event.accept()
 
+
+#-----------------------------------------多段剪辑--------------------------------------------------------#
+
+# -------------------------------------------------------
+# 1. 多段波形图控件  （在 WaveformCanvas 基础上派生）
+# -------------------------------------------------------
+class MultiCutCanvas(WaveformCanvas):
+
+    def __init__(self, main_window, parent=None, width=5, height=4, dpi=100):
+        super().__init__(main_window, parent, width, height, dpi)
+        # 分割线:  {uid: matplotlib.lines.Line2D}
+        self.split_lines = {}
+        # 记录时间值: {uid: sec}
+        self._uid_sec = {}
+        self.playhead_line = None
+
+    def add_split_line(self, sec=None):
+        """新增一条分割线并返回 uid"""
+        uid = str(uuid.uuid4())
+        if sec is None:
+            sec = self.duration / 2
+        line = Line2D([sec, sec],
+                      [self.ylim[0], self.ylim[1]],
+                      color='#ffff00', linewidth=1.5, zorder=15)
+        self.axes.add_line(line)
+        self.split_lines[uid] = line
+        self._uid_sec[uid] = sec
+        self.draw_idle()
+        return uid
+
+    def remove_split_line(self, uid):
+        if uid in self.split_lines:
+            try:
+                self.split_lines[uid].remove()
+            except Exception:
+                pass
+            self.split_lines.pop(uid, None)
+            self._uid_sec.pop(uid, None)
+            self.draw_idle()
+
+    def move_split_line(self, uid, sec):
+        """外部修改时间值后重绘"""
+        if uid in self.split_lines:
+            self.split_lines[uid].set_xdata([sec, sec])
+            self._uid_sec[uid] = sec
+            self.draw_idle()
+
+    def clear_all_splits(self):
+        for uid in list(self.split_lines.keys()):
+            self.remove_split_line(uid)
+
+    # ---------- 供外部调用 ----------
+    def list_split_times(self):
+        """返回所有分割点升序列表"""
+        return sorted(self._uid_sec.values())
+
+    # ---------- 鼠标事件 ----------
+    def on_click(self, event):
+        if not self.is_loaded or event.inaxes != self.axes or event.xdata is None:
+            self.dragging = None
+            return
+        sec = event.xdata
+        # 判断是否在已有线上（容差）
+        for uid, ln in self.split_lines.items():
+            if abs(ln.get_xdata()[0] - sec) < 0.3:
+                self.dragging = uid
+                return
+        # 否则新增
+        uid = self.add_split_line(sec)
+        self.main_window._sync_list_from_canvas()
+
+    def on_motion(self, event):
+        if not self.is_loaded or self.dragging is None or event.inaxes != self.axes or event.xdata is None:
+            return
+        new_sec = max(0, min(self.duration, event.xdata))
+        uid = self.dragging
+        self.move_split_line(uid, new_sec)
+        self.main_window._sync_list_from_canvas()
+
+    def on_release(self, event):
+        self.dragging = None
+
+    def clear_playhead(self):
+        if self.playhead_line:
+            try:
+                self.playhead_line.remove()
+            except Exception:
+                pass
+            self.playhead_line = None
+        self.draw_idle()
+
+    def set_playhead_position(self, sec):
+        if not self.is_loaded:
+            return
+        if self.playhead_line is None:
+            self.playhead_line = Line2D([0, 0], [self.ylim[0], self.ylim[1]],
+                                        color='red', linewidth=1.2, zorder=16)
+            self.axes.add_line(self.playhead_line)
+        self.playhead_line.set_xdata([sec, sec])
+        self.playhead_line.set_visible(True)
+        self.draw_idle()
+
+    def _draw_highlight(self):
+        # Multi-cut 模式不需要高亮区域
+        pass
+
+    def _draw_markers(self):
+        # Multi-cut 模式不需要三角箭头与图例
+        pass
+# -------------------------------------------------------
+# 2. 多段导出线程
+# -------------------------------------------------------
+class MultiExportThread(QThread):
+    progress_updated = pyqtSignal(int)
+    processing_finished = pyqtSignal(list)
+    processing_error = pyqtSignal(str)
+
+    def __init__(self, input_file, output_dir, split_times, base_name):
+        super().__init__()
+        self.input_file = input_file
+        self.output_dir = output_dir
+        self.split_times = [int(t * 1000) for t in split_times]  # ms
+        self.base_name = base_name
+        self.stop_flag = False
+
+    def stop(self):
+        self.stop_flag = True
+        self.wait()
+
+    def run(self):
+        try:
+            audio = AudioSegment.from_file(self.input_file)
+            total = len(self.split_times) + 1
+            out_files = []
+            prev = 0
+            for idx, point in enumerate(self.split_times + [len(audio)]):
+                if self.stop_flag:
+                    return
+                chunk = audio[prev:point]
+                file_path = os.path.join(self.output_dir,
+                                         f"{self.base_name}_{idx+1:03d}.mp3")
+                bitrate = f"{audio.frame_rate//1000}k" if audio.frame_rate > 0 else "192k"
+                chunk.export(file_path, format="mp3", bitrate=bitrate, parameters=["-q:a", "0"])
+                out_files.append(file_path)
+                prev = point
+                self.progress_updated.emit(int((idx + 1) * 100 / total))
+            if not self.stop_flag:
+                self.processing_finished.emit(out_files)
+        except Exception as e:
+            if not self.stop_flag:
+                self.processing_error.emit(str(e))
+
+# -------------------------------------------------------
+# 3. MultiCut Mode
+# -------------------------------------------------------
+
+class MultiCutWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.audio_file = None
+        self.audio_segment = None
+        self.player = QMediaPlayer(None, QMediaPlayer.StreamPlayback)
+        self.player.positionChanged.connect(self.update_position)
+        self.player.durationChanged.connect(self.update_duration)
+        self.player.stateChanged.connect(self.update_player_state)
+        self.playback_end_time = None
+        self.export_thread = None
+        self._uid_sec = {}          # uid -> sec
+        self.init_ui()
+
+    # --------------------------------------------------
+    # 1. 界面布局
+    # --------------------------------------------------
+    def init_ui(self):
+        self.setStyleSheet(STYLESHEET)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 20, 20, 20)
+        v.setSpacing(15)
+
+        # 1) 文件区（与 AB 模式一致）
+        self.file_area = QFrame()
+        self.file_area.setObjectName("PanelFrame")
+        flay = QVBoxLayout(self.file_area)
+        flay.setContentsMargins(15, 15, 15, 15)
+        self.file_label = QLabel('Drag & drop an audio file here')
+        self.file_label.setAlignment(Qt.AlignCenter)
+        self.file_label.setObjectName("DropLabel")
+
+        h = QHBoxLayout()
+        h.addStretch()
+        self.select_btn = QPushButton("Load MP3 File ...")
+        self.select_btn.clicked.connect(self.select_file)
+        self.cancel_load_btn = QPushButton("Cancel Load")
+        self.cancel_load_btn.setEnabled(False)
+        self.cancel_load_btn.setObjectName("DangerButton")
+        self.cancel_load_btn.clicked.connect(self.cancel_loading)
+        h.addWidget(self.select_btn)
+        h.addWidget(self.cancel_load_btn)
+        h.addStretch()
+        self.load_progress = QProgressBar()
+        self.load_progress.setVisible(False)
+        self.load_progress.setObjectName("LoadProgressBar")
+        flay.addWidget(self.file_label)
+        flay.addLayout(h)
+        flay.addWidget(self.load_progress)
+        v.addWidget(self.file_area)
+
+        # 2) 波形图
+        self.wave_frame = QFrame()
+        self.wave_frame.setObjectName("WaveformFrame")
+        wlay = QVBoxLayout(self.wave_frame)
+        wlay.setContentsMargins(0, 0, 0, 0)
+        self.canvas = MultiCutCanvas(self, width=10, height=6, dpi=100)
+        wlay.addWidget(self.canvas)
+        v.addWidget(self.wave_frame, 1)
+
+        # 3) Split Points 列表 + 按钮（放在波形下方）
+        split_box = QFrame()
+        split_box.setObjectName("PanelFrame")
+        splay = QVBoxLayout(split_box)
+        splay.setContentsMargins(15, 10, 15, 10)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Split Points (double-click to edit)"))
+        splay.addLayout(top)
+
+        self.time_list = QListWidget()
+        self.time_list.setObjectName("TimeList")
+        self.time_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.time_list.itemDoubleClicked.connect(self.edit_list_item)
+        splay.addWidget(self.time_list)
+
+        btn_lay = QHBoxLayout()
+        self.add_btn   = QPushButton("Add")
+        self.del_btn   = QPushButton("Delete")
+        self.clear_btn = QPushButton("Clear All")
+        for b in (self.add_btn, self.del_btn, self.clear_btn):
+            b.setMinimumWidth(80)
+        btn_lay.addWidget(self.add_btn)
+        btn_lay.addWidget(self.del_btn)
+        btn_lay.addWidget(self.clear_btn)
+        btn_lay.addStretch()
+        splay.addLayout(btn_lay)
+        v.addWidget(split_box)
+
+        # 4) 预览播放条（Play / Stop / 滑块）
+        play_box = QFrame()
+        play_box.setObjectName("PanelFrame")
+        play_lay = QHBoxLayout(play_box)
+        play_lay.setContentsMargins(15, 5, 15, 5)
+
+        self.play_btn = QPushButton()
+        self.play_btn.setIcon(get_icon_from_b64(ICON_PLAY))
+        self.play_btn.setObjectName("PlayerButton")
+        self.play_btn.setEnabled(False)
+
+        self.stop_btn = QPushButton()
+        self.stop_btn.setIcon(get_icon_from_b64(ICON_STOP))
+        self.stop_btn.setObjectName("PlayerButton")
+        self.stop_btn.setEnabled(False)
+
+        self.pos_slider = QSlider(Qt.Horizontal)
+        self.pos_slider.setObjectName("PositionSlider")
+
+        play_lay.addWidget(self.play_btn)
+        play_lay.addWidget(self.stop_btn)
+        play_lay.addWidget(self.pos_slider, 1)
+        v.addWidget(play_box)
+
+        # 5) Export All Clips + 进度（最下方）
+        exp_lay = QHBoxLayout()
+        self.prog = QProgressBar()
+        self.prog.setVisible(False)
+        self.prog.setObjectName("ExportProgressBar")
+        self.export_btn = QPushButton("Export All Clips")
+        self.export_btn.setEnabled(False)
+        self.export_btn.setObjectName("SuccessButton")
+        exp_lay.addWidget(self.prog, 1)
+        exp_lay.addWidget(self.export_btn)
+        v.addLayout(exp_lay)
+
+        # 信号连接
+        self.play_btn.clicked.connect(self.play_preview)
+        self.stop_btn.clicked.connect(self.stop_preview)
+        self.add_btn.clicked.connect(self.add_time)
+        self.del_btn.clicked.connect(self.del_time)
+        self.clear_btn.clicked.connect(self.clear_all)
+        self.export_btn.clicked.connect(self.export_clips)
+
+        self.setAcceptDrops(True)
+        self.file_area.setAcceptDrops(True)
+        self.file_area.dragEnterEvent = self.drag_enter_event
+        self.file_area.dropEvent      = self.drop_event
+
+    # --------------------------------------------------
+    # 2. 文件加载（与 AB 模式一致）
+    # --------------------------------------------------
+    def drag_enter_event(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def drop_event(self, event):
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith(('.mp3', '.wav', '.ogg', '.flac')):
+                self.load_audio(path)
+                break
+
+    def select_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Audio", "", "Audio Files (*.mp3 *.wav *.ogg *.flac)")
+        if path:
+            self.load_audio(path)
+
+    def load_audio(self, path):
+        if hasattr(self, 'load_thread') and self.load_thread and self.load_thread.isRunning():
+            self.load_thread.stop()
+        self.canvas.clear()
+        self.canvas.clear_all_splits()
+        self._uid_sec.clear()
+        self.time_list.clear()
+        self.audio_file = path
+        self.file_label.setText(f'Loading: {os.path.basename(path)}')
+        self.load_progress.setVisible(True)
+        self.load_progress.setValue(0)
+        self.select_btn.setEnabled(False)
+        self.cancel_load_btn.setEnabled(True)
+        self.export_btn.setEnabled(False)
+        self.play_btn.setEnabled(False)
+        self.load_thread = WaveformLoadingThread(path)
+        self.load_thread.progress_updated.connect(self.load_progress.setValue)
+        self.load_thread.loading_finished.connect(self.on_wave_loaded)
+        self.load_thread.loading_error.connect(self.on_wave_error)
+        self.load_thread.start()
+
+    def cancel_loading(self):
+        if self.load_thread and self.load_thread.isRunning():
+            self.load_thread.stop()
+            self.on_loading_canceled()
+
+    def on_loading_canceled(self):
+        self.file_label.setText('Drag & drop an audio file here')
+        self.load_progress.setVisible(False)
+        self.select_btn.setEnabled(True)
+        self.cancel_load_btn.setEnabled(False)
+
+    def on_wave_loaded(self, data, sr):
+        samples, times, duration = data
+        self.canvas.plot_waveform(samples, times, duration, sr)
+        self.audio_segment = AudioSegment.from_file(self.audio_file)
+        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(self.audio_file)))
+    
+        # 插入不可删除的 0.000
+        self.canvas.add_split_line(0.0)
+        self._sync_list_from_canvas()
+    
+        self.file_label.setText(f'【 {os.path.basename(self.audio_file)} ({duration:.2f}s)】')
+        self.load_progress.setVisible(False)
+        self.select_btn.setEnabled(True)
+        self.cancel_load_btn.setEnabled(False)
+        self.export_btn.setEnabled(True)
+        self.play_btn.setEnabled(True)
+
+    def on_wave_error(self, msg):
+        QMessageBox.critical(self, "Loading Error", msg)
+        self.on_loading_canceled()
+
+    # --------------------------------------------------
+    # 3. 列表 & 波形同步
+    # --------------------------------------------------
+    def _sync_list_from_canvas(self):
+        self.time_list.clear()
+        times = sorted(self.canvas._uid_sec.values())
+        for uid, sec in sorted(self.canvas._uid_sec.items(), key=lambda x: x[1]):
+            item = QListWidgetItem(f"{sec:.3f}")
+            item.setData(Qt.UserRole, (uid, sec))
+            if abs(sec) < 1e-6:          # 0.000 不可删除
+                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+            self.time_list.addItem(item)
+
+    def add_time(self):
+        current = self.player.position() / 1000.0 if self.player.state() == QMediaPlayer.PlayingState else 0.0
+        sec, ok = QInputDialog.getDouble(self, "Add Split Point", "Time (sec):",
+                                         value=max(0, current), decimals=3,
+                                         min=0, max=self.canvas.duration)
+
+        if ok:
+            self.canvas.add_split_line(sec)
+            self._sync_list_from_canvas()
+
+    def del_time(self):
+        row = self.time_list.currentRow()
+        if row < 0:
+            return
+        uid, _ = self.time_list.item(row).data(Qt.UserRole)
+        self.canvas.remove_split_line(uid)
+        self._sync_list_from_canvas()
+
+    def clear_all(self):
+        self.canvas.clear_all_splits()
+        self._sync_list_from_canvas()
+
+    def edit_list_item(self, item):
+        uid, old_sec = item.data(Qt.UserRole)
+        new_sec, ok = QInputDialog.getDouble(self, "Edit", "Time (sec):",
+                                             value=old_sec, decimals=3,
+                                             min=0, max=self.canvas.duration)
+        if ok and abs(new_sec - old_sec) > 1e-6:
+            self.canvas.move_split_line(uid, new_sec)
+            self._sync_list_from_canvas()
+
+    # --------------------------------------------------
+    # 4. 预览播放
+    # --------------------------------------------------
+    def play_preview(self):
+        if not self.canvas.is_loaded:
+            return
+        times = sorted(self.canvas._uid_sec.values())
+        row = self.time_list.currentRow()
+        if row < 0:
+            row = 0
+        start = times[row]
+        end   = times[row + 1] if row + 1 < len(times) else self.canvas.duration
+        self.playback_end_time = int(end * 1000)
+        self.player.setPosition(int(start * 1000))
+        self.player.play()
+        self.canvas.set_playhead_position(start)   # 立即显示红线
+
+    def stop_preview(self):
+        self.player.stop()
+        self.canvas.clear_playhead()
+
+    def seek_preview(self, pos):
+        self.player.setPosition(pos)
+
+    def update_position(self, pos):
+        if self.playback_end_time and pos >= self.playback_end_time:
+            self.stop_preview()
+        else:
+            if not self.pos_slider.isSliderDown():
+                self.pos_slider.setValue(pos)
+            self.canvas.set_playhead_position(pos / 1000.0)
+
+    def update_duration(self, dur):
+        self.pos_slider.setRange(0, dur)
+
+    def update_player_state(self, state):
+        self.play_btn.setEnabled(state != QMediaPlayer.PlayingState)
+        self.stop_btn.setEnabled(state == QMediaPlayer.PlayingState)
+
+    def export_clips(self):
+        if not self.audio_file or not self.canvas.is_loaded:
+            return
+        times = sorted(self.canvas._uid_sec.values())
+        if not times:
+            QMessageBox.information(self, "Info", "No split points.")
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if not out_dir:
+            return
+        base = os.path.splitext(os.path.basename(self.audio_file))[0]
+        self.export_thread = MultiExportThread(self.audio_file, out_dir, times, base)
+        self.export_thread.progress_updated.connect(self.prog.setValue)
+        self.export_thread.processing_finished.connect(self.on_export_done)
+        self.export_thread.processing_error.connect(self.on_export_error)
+        self.prog.setVisible(True)
+        self.export_btn.setEnabled(False)
+        self.export_thread.start()
+
+    def on_export_done(self, files):
+        self.prog.setVisible(False)
+        self.export_btn.setEnabled(True)
+        QMessageBox.information(self, "Done", f"Exported {len(files)} clips:\n" + "\n".join(files))
+
+    def on_export_error(self, msg):
+        self.prog.setVisible(False)
+        self.export_btn.setEnabled(True)
+        QMessageBox.critical(self, "Error", msg)
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MP3 Cutter")
+        self.setGeometry(100, 100, 1400, 1200)
+        self.tabs = QTabWidget()
+        self.ab_widget  = MP3Cutter()
+        self.multi_widget = MultiCutWidget()
+        self.tabs.addTab(self.ab_widget,  "AB Clip")
+        self.tabs.addTab(self.multi_widget, "Multi-Cut")
+        self.setCentralWidget(self.tabs)
+
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setApplicationName("MP3 Cutter Pro")
@@ -842,6 +1340,9 @@ if __name__ == '__main__':
             background: {ACCENT_COLOR};
             border-radius: 4px;
         }}
+		QListWidget{{
+            background-color: #e7e9e9;
+		}}
         QProgressBar {{
             border-radius: 6px;
             text-align: center;
@@ -891,8 +1392,37 @@ if __name__ == '__main__':
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
             background: none;
         }}
+        QTabWidget::pane {{
+            border: 1px solid #3a3a4a;
+            background: #1e1e2e;          
+        }}
+        
+        QTabBar::tab {{
+            background: #2d2d3d;
+            color: #efefef;
+            padding: 10px 20px;
+            margin-right: 2px;
+            border-top-left-radius: 6px;
+            border-top-right-radius: 6px;
+			width:150px;
+        }}
+        
+        QTabBar::tab:selected {{
+            background: #0080ff;
+            color: #ffff00;
+			font-weight:bold;
+        }}
+        
+        QTabBar::tab:hover:!selected {{
+            background: #3a3a4a;
+        }}
+        
+        QTabBar::tab:disabled {{
+            color: #777777;
+        }}
 
     """
     app.setStyleSheet(STYLESHEET)
-    window = MP3Cutter()
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec_())
