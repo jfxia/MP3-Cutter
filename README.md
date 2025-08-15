@@ -1,6 +1,8 @@
 # MP3 Cutter
 
-![screenshot](/assets/screenshot1.png)
+![AB Clip](/assets/screenshot1.png)
+
+![Multi-Cut Mode](/assets/screenshot2.png)
 
 ## Features
 
