@@ -10,9 +10,11 @@
 • Real-time waveform visualization with smooth zoom (mouse wheel).  
 • Interactive selection:  
 【AB Clip Mode】
+
  – Drag triangular markers for start/end.  
  – Or type exact time in HH:mm:ss.zzz fields.  
 【Multi-Cut Mode】
+
  – Click the waveform to set split points.  
  – Or modify exact time in the time list.  
 • Instant preview – play only the selected region.  
